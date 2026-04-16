@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import { generateSchedule, recommendedRounds } from '../lib/scheduler';
+import { generateNextRound } from '../lib/scheduler';
 import { supabase, isSupabaseConfigured } from '../lib/supabase';
 
 let nextPlayerId = 1;
@@ -119,6 +119,40 @@ async function deleteTournamentFromSupabase(supabaseId) {
   }
 }
 
+/**
+ * Helper: convert 0-indexed round (from scheduler) to player-ID-indexed round.
+ * The scheduler works with indices 0..N-1, but the store uses actual player IDs.
+ */
+function mapRoundToPlayerIds(round, playerIds) {
+  return {
+    ...round,
+    matches: round.matches.map((match) => ({
+      ...match,
+      team1: match.team1.map((idx) => playerIds[idx]),
+      team2: match.team2.map((idx) => playerIds[idx]),
+    })),
+    resting: round.resting.map((idx) => playerIds[idx]),
+  };
+}
+
+/**
+ * Helper: convert player-ID-indexed rounds back to 0-indexed for the scheduler.
+ */
+function mapRoundsToIndices(rounds, playerIds) {
+  const idToIdx = {};
+  playerIds.forEach((id, idx) => { idToIdx[id] = idx; });
+
+  return rounds.map((round) => ({
+    ...round,
+    matches: round.matches.map((match) => ({
+      ...match,
+      team1: match.team1.map((id) => idToIdx[id]),
+      team2: match.team2.map((id) => idToIdx[id]),
+    })),
+    resting: round.resting.map((id) => idToIdx[id]),
+  }));
+}
+
 // ============================================
 // Store
 // ============================================
@@ -126,23 +160,22 @@ async function deleteTournamentFromSupabase(supabaseId) {
 const useTournamentStore = create(
   persist(
     (set, get) => ({
-      // Config
+      // Config (nbRounds removed — rounds are now dynamic)
       config: {
         courts: 2,
         pointsPerMatch: 20,
-        nbRounds: 3,
       },
 
       // Players list
       players: [],
 
-      // Generated rounds
+      // Generated rounds (grows dynamically)
       rounds: [],
 
       // Current round index (0-based)
       currentRound: 0,
 
-      // Tournament status
+      // Tournament status: 'setup' | 'in_progress' | 'round_validated' | 'completed'
       status: 'setup',
 
       // Tournament name
@@ -176,49 +209,30 @@ const useTournamentStore = create(
             ...state.players,
             { id, name, level, avatar },
           ];
-          return {
-            players: newPlayers,
-            config: {
-              ...state.config,
-              nbRounds: recommendedRounds(newPlayers.length),
-            },
-          };
+          return { players: newPlayers };
         }),
 
       removePlayer: (id) =>
-        set((state) => {
-          const newPlayers = state.players.filter((p) => p.id !== id);
-          return {
-            players: newPlayers,
-            config: {
-              ...state.config,
-              nbRounds: recommendedRounds(newPlayers.length),
-            },
-          };
-        }),
+        set((state) => ({
+          players: state.players.filter((p) => p.id !== id),
+        })),
 
+      /**
+       * Start the tournament: generate only the first round
+       */
       generateTournament: async () => {
         const state = get();
-        const { courts, nbRounds } = state.config;
+        const { courts } = state.config;
         const nbPlayers = state.players.length;
 
         if (nbPlayers < 4) return;
 
         const playerIds = state.players.map((p) => p.id);
-        const rounds = generateSchedule(nbPlayers, courts, nbRounds);
-
-        const mappedRounds = rounds.map((round) => ({
-          ...round,
-          matches: round.matches.map((match) => ({
-            ...match,
-            team1: match.team1.map((idx) => playerIds[idx]),
-            team2: match.team2.map((idx) => playerIds[idx]),
-          })),
-          resting: round.resting.map((idx) => playerIds[idx]),
-        }));
+        const firstRound = generateNextRound(nbPlayers, courts, []);
+        const mappedRound = mapRoundToPlayerIds(firstRound, playerIds);
 
         set({
-          rounds: mappedRounds,
+          rounds: [mappedRound],
           currentRound: 0,
           status: 'in_progress',
         });
@@ -228,7 +242,7 @@ const useTournamentStore = create(
           name: state.tournamentName || `Tournoi du ${new Date().toLocaleDateString('fr-FR')}`,
           config: state.config,
           players: state.players,
-          rounds: mappedRounds,
+          rounds: [mappedRound],
           currentRound: 0,
           status: 'in_progress',
         });
@@ -254,6 +268,11 @@ const useTournamentStore = create(
           return { rounds: newRounds };
         }),
 
+      /**
+       * Validate the current round scores.
+       * Does NOT auto-finish. Sets status to 'round_validated' so the UI can offer
+       * "add round" or "finish tournament".
+       */
       validateRound: async () => {
         const state = get();
         const currentRound = state.currentRound;
@@ -264,67 +283,104 @@ const useTournamentStore = create(
         );
         if (!allScored) return;
 
-        const nextRound = currentRound + 1;
-        const isLast = nextRound >= state.rounds.length;
+        set({ status: 'round_validated' });
 
-        if (isLast) {
-          // Tournament completed
-          const ranking = computeRanking(state.players, state.rounds);
-          const tournamentName = state.tournamentName || `Tournoi du ${new Date().toLocaleDateString('fr-FR')}`;
+        // Sync progress to Supabase
+        saveTournamentToSupabase({
+          supabaseId: state.supabaseId,
+          name: state.tournamentName || `Tournoi du ${new Date().toLocaleDateString('fr-FR')}`,
+          config: state.config,
+          players: state.players,
+          rounds: state.rounds,
+          currentRound: state.currentRound,
+          status: 'in_progress',
+        });
+      },
 
-          const archived = {
-            id: Date.now(), // unique local ID
-            supabaseId: state.supabaseId,
-            name: tournamentName,
-            date: new Date().toISOString(),
-            config: { ...state.config },
-            players: [...state.players],
-            rounds: [...state.rounds],
-            ranking,
-            winner: ranking[0] || null,
-          };
+      /**
+       * Generate and add the next round based on all previous rounds' history.
+       */
+      addNextRound: async () => {
+        const state = get();
+        const { courts } = state.config;
+        const playerIds = state.players.map((p) => p.id);
+        const nbPlayers = state.players.length;
 
-          set({
-            currentRound: nextRound - 1,
-            status: 'completed',
-            history: [archived, ...state.history],
-          });
+        // Convert existing rounds back to 0-indexed for the scheduler
+        const indexedRounds = mapRoundsToIndices(state.rounds, playerIds);
 
-          // Sync to Supabase
-          await saveTournamentToSupabase({
-            supabaseId: state.supabaseId,
-            name: tournamentName,
-            config: state.config,
-            players: state.players,
-            rounds: state.rounds,
-            currentRound: nextRound - 1,
-            status: 'completed',
-            ranking,
-            winner: ranking[0] || null,
-          });
-        } else {
-          set({ currentRound: nextRound });
+        // Generate next round
+        const nextRound = generateNextRound(nbPlayers, courts, indexedRounds);
+        const mappedRound = mapRoundToPlayerIds(nextRound, playerIds);
 
-          // Sync progress to Supabase
-          saveTournamentToSupabase({
-            supabaseId: state.supabaseId,
-            name: state.tournamentName || `Tournoi du ${new Date().toLocaleDateString('fr-FR')}`,
-            config: state.config,
-            players: state.players,
-            rounds: state.rounds,
-            currentRound: nextRound,
-            status: 'in_progress',
-          });
-        }
+        const newRounds = [...state.rounds, mappedRound];
+        const newCurrentRound = newRounds.length - 1;
+
+        set({
+          rounds: newRounds,
+          currentRound: newCurrentRound,
+          status: 'in_progress',
+        });
+
+        // Sync to Supabase
+        saveTournamentToSupabase({
+          supabaseId: state.supabaseId,
+          name: state.tournamentName || `Tournoi du ${new Date().toLocaleDateString('fr-FR')}`,
+          config: state.config,
+          players: state.players,
+          rounds: newRounds,
+          currentRound: newCurrentRound,
+          status: 'in_progress',
+        });
+      },
+
+      /**
+       * Finish the tournament: compute ranking, archive, sync.
+       */
+      finishTournament: async () => {
+        const state = get();
+        const ranking = computeRanking(state.players, state.rounds);
+        const tournamentName = state.tournamentName || `Tournoi du ${new Date().toLocaleDateString('fr-FR')}`;
+
+        const archived = {
+          id: Date.now(),
+          supabaseId: state.supabaseId,
+          name: tournamentName,
+          date: new Date().toISOString(),
+          config: { ...state.config },
+          players: [...state.players],
+          rounds: [...state.rounds],
+          ranking,
+          winner: ranking[0] || null,
+        };
+
+        set({
+          status: 'completed',
+          history: [archived, ...state.history],
+        });
+
+        // Sync to Supabase
+        await saveTournamentToSupabase({
+          supabaseId: state.supabaseId,
+          name: tournamentName,
+          config: state.config,
+          players: state.players,
+          rounds: state.rounds,
+          currentRound: state.currentRound,
+          status: 'completed',
+          ranking,
+          winner: ranking[0] || null,
+        });
       },
 
       getRanking: () => {
         const state = get();
         const { players, rounds, currentRound } = state;
 
+        // Include current round if it's been validated
         const completedRounds =
-          state.status === 'completed'
-            ? rounds
+          state.status === 'completed' || state.status === 'round_validated'
+            ? rounds.slice(0, currentRound + 1)
             : rounds.slice(0, currentRound);
 
         return computeRanking(players, completedRounds);
@@ -402,7 +458,7 @@ const useTournamentStore = create(
 
       resetTournament: () =>
         set({
-          config: { courts: 2, pointsPerMatch: 20, nbRounds: 3 },
+          config: { courts: 2, pointsPerMatch: 20 },
           players: [],
           rounds: [],
           currentRound: 0,

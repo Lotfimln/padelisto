@@ -123,29 +123,7 @@ export default function SetupScreen({ onStart }) {
         </p>
       </div>
 
-      {/* Number of rounds */}
-      <div className="glass-card p-4">
-        <div className="flex items-center justify-between mb-3">
-          <label className="text-xs font-semibold uppercase tracking-wider text-text-muted">
-            Nombre de rounds
-          </label>
-          <span className="text-lg font-bold text-accent tabular-nums">{config.nbRounds}</span>
-        </div>
-        <input
-          type="range"
-          min={1}
-          max={Math.max(10, config.nbRounds + 2)}
-          value={config.nbRounds}
-          onChange={(e) => updateConfig({ nbRounds: parseInt(e.target.value) })}
-          className="w-full h-2 bg-bg-card rounded-full appearance-none cursor-pointer
-                     [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-6 [&::-webkit-slider-thumb]:h-6
-                     [&::-webkit-slider-thumb]:bg-accent [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:cursor-pointer
-                     [&::-webkit-slider-thumb]:shadow-lg [&::-webkit-slider-thumb]:shadow-accent/30"
-        />
-        <p className="text-[11px] text-text-dim mt-2">
-          Recommandé : {players.length >= 4 ? Math.ceil(players.length / 2) - 1 : '–'} rounds pour {players.length} joueurs
-        </p>
-      </div>
+
 
       {/* Add player form */}
       <div className="glass-card p-4">
@@ -248,7 +226,7 @@ export default function SetupScreen({ onStart }) {
           }`}
       >
         {hasEnoughPlayers
-          ? `🚀 Lancer le tournoi (${config.nbRounds} rounds)`
+          ? '🚀 Lancer le tournoi'
           : `Ajoute encore ${minPlayers - players.length} joueur${minPlayers - players.length > 1 ? 's' : ''}`
         }
       </button>

@@ -16,7 +16,7 @@ export default function BottomNav({ activeTab, onTabChange, status, currentRound
     if (status === 'setup') {
       return tabId !== 'setup';
     }
-    if (status === 'in_progress') {
+    if (status === 'in_progress' || status === 'round_validated') {
       return tabId === 'podium';
     }
     return false;
@@ -62,7 +62,7 @@ export default function BottomNav({ activeTab, onTabChange, status, currentRound
               </span>
 
               {/* Badge on Rounds tab */}
-              {tab.id === 'rounds' && status === 'in_progress' && (
+              {tab.id === 'rounds' && (status === 'in_progress' || status === 'round_validated') && (
                 <span className="absolute -top-0.5 right-1 min-w-[16px] h-[16px] flex items-center justify-center bg-accent text-bg-primary text-[9px] font-bold rounded-full px-0.5">
                   {currentRound + 1}
                 </span>

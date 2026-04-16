@@ -253,6 +253,177 @@ export function generateSchedule(nbPlayers, nbCourts, nbRounds) {
 }
 
 /**
+ * Generate a single next round based on previous rounds' history.
+ * Rebuilds constraint matrices from previousRounds to make optimal choices.
+ * 
+ * @param {number} nbPlayers - total number of players (0-indexed)
+ * @param {number} nbCourts - number of available courts
+ * @param {Array} previousRounds - array of previously played round objects
+ *   Each round has: { matches: [{ team1: [idx, idx], team2: [idx, idx], court }], resting: [idx, ...] }
+ * @returns {object} - a single round object with matches and resting players
+ */
+export function generateNextRound(nbPlayers, nbCourts, previousRounds) {
+  const playersPerMatch = 4;
+  const playersPerRound = nbCourts * playersPerMatch;
+  const hasResting = nbPlayers > playersPerRound;
+
+  // Rebuild constraint matrices from history
+  const partnerCount = createMatrix(nbPlayers);
+  const opponentCount = createMatrix(nbPlayers);
+  const restCount = new Array(nbPlayers).fill(0);
+  const courtCount = Array.from({ length: nbPlayers }, () => new Array(nbCourts).fill(0));
+  const matchCount = new Array(nbPlayers).fill(0);
+
+  for (const round of previousRounds) {
+    for (const match of round.matches) {
+      // Partner counts
+      partnerCount[match.team1[0]][match.team1[1]]++;
+      partnerCount[match.team1[1]][match.team1[0]]++;
+      partnerCount[match.team2[0]][match.team2[1]]++;
+      partnerCount[match.team2[1]][match.team2[0]]++;
+
+      // Opponent counts
+      for (const a of match.team1) {
+        for (const b of match.team2) {
+          opponentCount[a][b]++;
+          opponentCount[b][a]++;
+        }
+      }
+
+      // Court counts (court is 1-indexed in stored data)
+      const courtIdx = match.court - 1;
+      for (const p of [...match.team1, ...match.team2]) {
+        if (courtIdx >= 0 && courtIdx < nbCourts) {
+          courtCount[p][courtIdx]++;
+        }
+        matchCount[p]++;
+      }
+    }
+
+    for (const p of round.resting) {
+      restCount[p]++;
+    }
+  }
+
+  // Now generate exactly 1 round using the same greedy algorithm
+  const r = previousRounds.length;
+
+  // 1. Select resting players
+  let activePlayers;
+  let restingPlayers = [];
+
+  if (hasResting) {
+    const nbResting = nbPlayers - playersPerRound;
+    const allPlayers = Array.from({ length: nbPlayers }, (_, i) => i);
+    allPlayers.sort((a, b) => {
+      const diff = restCount[a] - restCount[b];
+      if (diff !== 0) return diff;
+      const matchDiff = matchCount[b] - matchCount[a];
+      if (matchDiff !== 0) return matchDiff;
+      return Math.random() - 0.5;
+    });
+
+    restingPlayers = allPlayers.slice(0, nbResting);
+    activePlayers = allPlayers.slice(nbResting);
+  } else {
+    activePlayers = Array.from({ length: nbPlayers }, (_, i) => i);
+  }
+
+  // 2. Generate all possible pairs from active players
+  const allPairs = combinations(activePlayers, 2);
+
+  const scoredPairs = allPairs.map(([a, b]) => ({
+    pair: [a, b],
+    score: pairScore(a, b, partnerCount),
+  }));
+
+  scoredPairs.sort((a, b) => {
+    if (a.score !== b.score) return a.score - b.score;
+    return Math.random() - 0.5;
+  });
+
+  // 3. Greedy match assignment
+  const matches = [];
+  const usedInRound = new Set();
+
+  for (let m = 0; m < nbCourts; m++) {
+    let bestMatch = null;
+    let bestScore = Infinity;
+
+    for (let i = 0; i < scoredPairs.length; i++) {
+      const [a, b] = scoredPairs[i].pair;
+      if (usedInRound.has(a) || usedInRound.has(b)) continue;
+
+      for (let j = i + 1; j < scoredPairs.length; j++) {
+        const [c, d] = scoredPairs[j].pair;
+        if (usedInRound.has(c) || usedInRound.has(d)) continue;
+        if (a === c || a === d || b === c || b === d) continue;
+
+        const pScore = scoredPairs[i].score + scoredPairs[j].score;
+        const oScore = opponentScore([a, b], [c, d], opponentCount);
+        const totalScore = pScore * 10 + oScore;
+
+        if (totalScore < bestScore) {
+          bestScore = totalScore;
+          bestMatch = { team1: [a, b], team2: [c, d] };
+        }
+      }
+    }
+
+    if (bestMatch) {
+      matches.push(bestMatch);
+      for (const p of [...bestMatch.team1, ...bestMatch.team2]) {
+        usedInRound.add(p);
+      }
+    }
+  }
+
+  // 4. Assign courts
+  const courtAssignments = [];
+  const availableCourts = Array.from({ length: nbCourts }, (_, i) => i);
+  const remainingMatches = [...matches];
+  const remainingCourts = [...availableCourts];
+
+  while (remainingMatches.length > 0 && remainingCourts.length > 0) {
+    let bestMatchIdx = 0;
+    let bestCourtIdx = 0;
+    let bestCourtScore = Infinity;
+
+    for (let mi = 0; mi < remainingMatches.length; mi++) {
+      const match = remainingMatches[mi];
+      const allMatchPlayers = [...match.team1, ...match.team2];
+
+      for (let ci = 0; ci < remainingCourts.length; ci++) {
+        const court = remainingCourts[ci];
+        const courtScore = allMatchPlayers.reduce((sum, p) => sum + courtCount[p][court], 0);
+
+        if (courtScore < bestCourtScore) {
+          bestCourtScore = courtScore;
+          bestMatchIdx = mi;
+          bestCourtIdx = ci;
+        }
+      }
+    }
+
+    const match = remainingMatches.splice(bestMatchIdx, 1)[0];
+    const court = remainingCourts.splice(bestCourtIdx, 1)[0];
+    courtAssignments.push({ ...match, court });
+  }
+
+  return {
+    roundNumber: r + 1,
+    matches: courtAssignments.map((m) => ({
+      court: m.court + 1,
+      team1: m.team1,
+      team2: m.team2,
+      score1: null,
+      score2: null,
+    })),
+    resting: restingPlayers,
+  };
+}
+
+/**
  * Calculate the recommended number of rounds
  * @param {number} nbPlayers
  * @returns {number}
